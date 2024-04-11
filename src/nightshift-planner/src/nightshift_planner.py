@@ -16,12 +16,36 @@ VERBOSE = True
 from franka_interface_msgs.msg import SensorDataGroup
 
 class PlannerNode:
+
+    #TODO: verify the tool pose for our end-effector
+    NIGHTSHIFT_TOOL_POSE = RigidTransform(
+            translation=np.array([0.106, -0.106, -0.01]),
+            rotation=np.array([[1, 0, 0],
+                                [0, 1, 0],
+                                [0,  0, 1]]),
+            from_frame="franka_tool",
+            to_frame="franka_tool_base"
+        )
+
+    #TODO: verify if this is a good pose from which the arm can start moving from
+    START_POSE = RigidTransform(
+            translation=np.array([0.56, 0, 0.4]),
+            rotation=np.array([[7.07185286e-01, -7.07028188e-01, -3.36139057e-04],
+                                [-7.07028245e-01, -7.07185062e-01, -5.90835436e-04],
+                                [1.80024788e-04,  6.55489934e-04, -9.99999769e-01]]),
+            from_frame="franka_tool",
+            to_frame="world"
+        )
+
+    #TODO: verify if this bounding box is what we want to go with
+    BOX_CORNER_MIN = np.array([0.46, -0.3, 0.2])
+    BOX_CORNER_MAX = np.array([0.66, 0.3, 0.7])
+
+
     @classmethod
     def __init__(self):
-        self.fa = FrankaArm()
-        ##TODO: Modify this with our end-effector 
-        # self.fa.set_tool_delta_pose(self.NIGHTSHIFT_TOOL_POSE)
-
+        self.fa = FrankaArm() 
+        self.fa.set_tool_delta_pose(self.NIGHTSHIFT_TOOL_POSE)
         self.reset()
     
     @classmethod
@@ -175,5 +199,13 @@ class PlannerNode:
         # print("Current error: ", np.linalg.norm(curr_pose.translation - goal_pose.translation))
         # print("Interpol pose: ", interpol_pose.translation)
         # print("Delta: ", delta)
+
+    @classmethod
+    def terminate_dynamic(self):
+        '''
+        '''
+
+    @classmethod
+    def is_valid_pose(self):
 
         
