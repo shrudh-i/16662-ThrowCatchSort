@@ -141,7 +141,7 @@ class PlannerNode:
                     self.goal_msg.point.x,
                     self.goal_msg.point.y,
                     self.goal_msg.point.z,
-                ]),
+                ]),# A good pose from where robot can start moving from
                 from_frame=current.from_frame,
                 to_frame=current.to_frame,
             )
@@ -201,11 +201,22 @@ class PlannerNode:
         # print("Delta: ", delta)
 
     @classmethod
-    def terminate_dynamic(self):
+    def terminate_dynamic(self, pose):
         '''
         '''
+        return np.all(pose.translation <= self.BOX_CORNER_MAX) and np.all(pose.translation >= self.BOX_CORNER_MIN)
 
     @classmethod
     def is_valid_pose(self):
-
-        
+        '''
+        '''
+        terminate_msg = ShouldTerminateSensorMessage(
+        timestamp=rospy.Time.now().to_time() - self.init_time, should_terminate=True
+        )
+        ros_msg = make_sensor_group_msg(
+            termination_handler_sensor_msg=sensor_proto2ros_msg(
+                terminate_msg, SensorDataMessageType.SHOULD_TERMINATE
+            )
+        )
+        self.pub.publish(ros_msg)
+        self.fa.wait_for_skill()
