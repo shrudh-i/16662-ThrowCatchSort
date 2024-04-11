@@ -46,16 +46,16 @@ class PlannerNode:
     @classmethod
     def dynamic_setup(self):
         '''
-        #TODO: Function description
+        Setting up dynamic params before catching
         '''
 
         if VERBOSE:
             rospy.loginfo("Setting up dynamic params")
 
-        # init the goal 
-        # self.goal_pose = None
+        # init the goal_pose 
+        # self.goal_msg = None
 
-        # retrieve goal position:
+        # retrieve goal_pose position:
         self.sub = rospy.Subscriber(
             #TODO: Confirm on the topic name
             "",
@@ -76,7 +76,7 @@ class PlannerNode:
         # self.rate = rospy.Rate(1 / self.dt)
 
         self.disp = 0.2
-        rospy.Time.now().to_time() # retrieve current time
+        self.init_time = rospy.Time.now().to_time() # retrieve current time
         self.id = 0 # further used when moving to catch point
 
         self.last_validpose_time = time.time()
@@ -89,13 +89,91 @@ class PlannerNode:
         self.fa.goto_pose(current, duration=self.dt, dynamic=True, buffer_time=500, block=False)
 
         if VERBOSE:
-            rospy.loginfo("Dynamic params setup")
+            rospy.loginfo("Dynamic params setcurr_poseup")
 
 
     @classmethod
-    def set_goal(self, goal_pose):
+    def set_goal(self, goal_msg):
         '''
-        Callback to store the subscribed goal pose 
+        Callback to store the subscribed goal_pose pose 
+        '''
+        self.goal_msg = goal_msg
+
+    @classmethod
+    def catch(self):
+        '''
+        Moving the Franka Arm to the catch point
         '''
 
-        self.goal_pose = goal_pose
+        current = self.fa.get_pose()
+        if np.any(np.isnan(current.translation)) or np.any(np.isnan(current.quaternion)):
+            print("Current pose has Nan")
+
+        if self.goal_msg is None:
+            goal_pose = current
+        else:
+            goal_pose = RigidTransform(
+                translation = np.array([
+                    self.goal_msg.point.x,
+                    self.goal_msg.point.y,
+                    self.goal_msg.point.z,
+                ]),
+                from_frame=current.from_frame,
+                to_frame=current.to_frame,
+            )
+
+        # store a copy of the current arm pose
+        intermediate = current
+
+        displacement = goal_pose.translation - current.translation
+        displ_norm = np.norm(displacement)
+
+        #TODO: verify if this heuristic holds
+        if np.abs(displ_norm) > 1e-3:
+            displacement = min(displ_norm, self.disp) * (displacement/displ_norm)
+        intermediate.translation = current.translation + displacement
+        timestamp = rospy.Time.now().to_time() - self.init_time
+
+        if not self.is_valid_pose(intermediate):
+            print("Invalid Pose:", intermediate.translation)
+            interpol_pose = current
+        else:
+            self.last_validpose_time = time.time()
+
+        if np.any(np.isnan(intermediate.translation)):
+            intermediate = current
+        #TODO: Check if the TOOL_DELTA_POSE is the same name being maintained
+        intermediate = intermediate * self.TOOL_DELTA_POSE.inverse()
+
+        traj_gen_msg = PosePositionSensorMessage(
+            id=self.id,
+            timestamp=timestamp,
+            position=intermediate.translation,
+            #TODO: Check if the START_POSE is the same name being maintained
+            quaternion=self.START_POSE.quaternion,
+        )
+        ros_msg = make_sensor_group_msg(
+            trajectory_generator_sensor_msg=sensor_proto2ros_msg(
+                traj_gen_msg, SensorDataMessageType.POSE_POSITION
+            )
+        )
+
+        if np.any(np.isnan(intermediate.translation)):
+            print("Nan in message")
+        self.pub.publish(ros_msg)
+        self.id += 1
+
+        if (time.time() - self.last_validpose_time > self.timeout):
+            self.is_resetting = True
+            print('Terminating...')
+            self.terminate_dynamic()
+            print("Terminated")
+            self.reset()
+        
+        ###################TEMP####################
+
+        # print("Current error: ", np.linalg.norm(curr_pose.translation - goal_pose.translation))
+        # print("Interpol pose: ", interpol_pose.translation)
+        # print("Delta: ", delta)
+
+        
