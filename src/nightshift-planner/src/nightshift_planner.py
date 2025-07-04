@@ -17,9 +17,10 @@ from franka_interface_msgs.msg import SensorDataGroup
 
 class PlannerNode:
 
-    #TODO: verify the tool pose for our end-effector
+    # End-Effector pose
     NIGHTSHIFT_TOOL_POSE = RigidTransform(
-            translation=np.array([0.106, -0.106, -0.01]),
+            # 8cm going down; 16cm going out from the end-effector base 
+            translation=np.array([0.16, 0, 0.08]),
             rotation=np.array([[1, 0, 0],
                                 [0, 1, 0],
                                 [0,  0, 1]]),
@@ -44,8 +45,13 @@ class PlannerNode:
 
     @classmethod
     def __init__(self):
-        self.fa = FrankaArm() 
+        print("FRANKA ARM IS GETTING INITIALIZED")
+        self.fa = FrankaArm(with_gripper=False) 
+
         self.fa.set_tool_delta_pose(self.NIGHTSHIFT_TOOL_POSE)
+        
+
+        self.is_resetting = True
         self.reset()
     
     @classmethod
@@ -56,13 +62,18 @@ class PlannerNode:
 
         if VERBOSE: 
             rospy.loginfo("Resetting the Franka Arm")
-
+        self.is_resetting = True
         self.fa.reset_joints()
+
+        #TODO: verify if we want the arm to start form a static pose
+        self.fa.goto_pose(self.START_POSE, duration=2)
+
         self.fa.stop_skill() # stops the current skill 
         self.fa.wait_for_skill() # waits for the current skill to be stopped
 
         self.dynamic_setup()
-
+        
+        self.is_resetting = False
         if VERBOSE:
             rospy.loginfo("Reset Complete")
 
@@ -77,14 +88,14 @@ class PlannerNode:
             rospy.loginfo("Setting up dynamic params")
 
         # init the goal_pose 
-        # self.goal_msg = None
+        self.goal_msg = None
 
         # retrieve goal_pose position:
         self.sub = rospy.Subscriber(
             #TODO: Confirm on the topic name
-            "",
+            "/intersect_position",
             PointStamped,
-            self.set_goal()
+            self.set_goal
         )
 
         self.pub = rospy.Publisher(
@@ -92,28 +103,39 @@ class PlannerNode:
             SensorDataGroup,
             queue_size=1000
         )
-        print(FC.DEFAULT_SENSOR_PUBLISHER_TOPIC)
+        if VERBOSE:
+            print(FC.DEFAULT_SENSOR_PUBLISHER_TOPIC)
+
+        #TODO: Confirm the speed at which we want the arm to move (duration)
+        self.dt = 0.1
 
         #TODO: Check if this is required
-        #TODO: Confirm the speed at which we want the arm to move (duration)
-        self.dt = 0.01
-        # self.rate = rospy.Rate(1 / self.dt)
+        self.rate = rospy.Rate(1 / self.dt)
 
-        self.disp = 0.2
+        self.disp = 0.25
         self.init_time = rospy.Time.now().to_time() # retrieve current time
         self.id = 0 # further used when moving to catch point
-
         self.last_validpose_time = time.time()
 
-        self.timer = rospy.Timer(rospy.Duration(self.dt), self.moveToCatch)
-        self.timeout = 5
+        self.timer = rospy.Timer(rospy.Duration(self.dt), self.catch)
+        self.timeout = 2
 
         current = self.fa.get_pose()
-        print("Initial pose: ", current.translation) 
+        
+        if VERBOSE:
+            print("Initial pose: ", current.translation) 
+            print("Initial rotatiom:", current.rotation)
+            # pass
+
+        print("first move goto_pose")
+        # self.fa.goto_pose(current, duration=self.dt, dynamic=True, buffer_time=500, block=False)
+        # self.fa.wait_for_skill()
+        current = self.fa.get_pose()
         self.fa.goto_pose(current, duration=self.dt, dynamic=True, buffer_time=500, block=False)
+        self.fa.wait_for_skill()
 
         if VERBOSE:
-            rospy.loginfo("Dynamic params setcurr_poseup")
+            rospy.loginfo("Dynamic params set")
 
 
     @classmethod
@@ -122,56 +144,70 @@ class PlannerNode:
         Callback to store the subscribed goal_pose pose 
         '''
         self.goal_msg = goal_msg
+        # print(self.goal_msg)
 
     @classmethod
-    def catch(self):
+    def catch(self, event):
         '''
         Moving the Franka Arm to the catch point
         '''
 
-        current = self.fa.get_pose()
-        if np.any(np.isnan(current.translation)) or np.any(np.isnan(current.quaternion)):
-            print("Current pose has Nan")
+        if self.is_resetting:
+            return
+
+        current_pose = self.fa.get_pose()
+        if np.any(np.isnan(current_pose.translation)) or np.any(np.isnan(current_pose.quaternion)):
+            if VERBOSE:
+                print("Current pose has Nan")
 
         if self.goal_msg is None:
-            goal_pose = current
+            goal_pose = current_pose
+            # goal_pose = event
         else:
             goal_pose = RigidTransform(
                 translation = np.array([
                     self.goal_msg.point.x,
                     self.goal_msg.point.y,
                     self.goal_msg.point.z,
-                ]),# A good pose from where robot can start moving from
-                from_frame=current.from_frame,
-                to_frame=current.to_frame,
+                ]),
+                from_frame=current_pose.from_frame,
+                to_frame=current_pose.to_frame,
             )
 
         # store a copy of the current arm pose
-        intermediate = current
+        intermediate = current_pose
 
-        displacement = goal_pose.translation - current.translation
-        displ_norm = np.norm(displacement)
+        # moving by a delta 
+        displacement = goal_pose.translation - current_pose.translation
+        displ_norm = np.linalg.norm(displacement)
 
         #TODO: verify if this heuristic holds
         if np.abs(displ_norm) > 1e-3:
             displacement = min(displ_norm, self.disp) * (displacement/displ_norm)
-        intermediate.translation = current.translation + displacement
+        
+        intermediate.translation = current_pose.translation + displacement
+        
         timestamp = rospy.Time.now().to_time() - self.init_time
+        # print(displacement)
 
         if not self.is_valid_pose(intermediate):
-            print("Invalid Pose:", intermediate.translation)
-            interpol_pose = current
+            if VERBOSE:
+                print("Invalid Pose:", intermediate.translation)
+                # pass
+            intermediate = current_pose
         else:
             self.last_validpose_time = time.time()
 
+        # account for the tool offset
         if np.any(np.isnan(intermediate.translation)):
-            intermediate = current
-        #TODO: Check if the TOOL_DELTA_POSE is the same name being maintained
-        intermediate = intermediate * self.TOOL_DELTA_POSE.inverse()
+            intermediate = current_pose
+        
+        intermediate = intermediate * self.NIGHTSHIFT_TOOL_POSE.inverse()
 
         traj_gen_msg = PosePositionSensorMessage(
             id=self.id,
             timestamp=timestamp,
+            # timestamp=15,
             position=intermediate.translation,
             #TODO: Check if the START_POSE is the same name being maintained
             quaternion=self.START_POSE.quaternion,
@@ -183,15 +219,36 @@ class PlannerNode:
         )
 
         if np.any(np.isnan(intermediate.translation)):
-            print("Nan in message")
+            if VERBOSE:
+                print("Nan in message")
         self.pub.publish(ros_msg)
         self.id += 1
+        
+        self.fa.wait_for_skill()
+        self.fa.stop_skill()
+
+        print('Sorting starts')
+        print('Start position')
+        self.fa.goto_joints( [0.13354869, -0.09719834, -0.17910186, -2.87180187,  0.0552314,   2.83424865, 0.70680245])
+
+        print('Left position')
+        self.fa.goto_joints([ 0.00350013,  0.04199704, -0.67248926, -2.47509156,  1.30884392,  1.13389734, 0.3047798 ])
+        time.sleep(2)
+
+        print('Start position')
+        self.fa.goto_joints( [0.13354869, -0.09719834, -0.17910186, -2.87180187,  0.0552314,   2.83424865, 0.70680245])
+
+        if VERBOSE:
+            print("TIME DIFFERENCE: ",time.time() - self.last_validpose_time)
+            # pass
 
         if (time.time() - self.last_validpose_time > self.timeout):
             self.is_resetting = True
-            print('Terminating...')
+            if VERBOSE:
+                print('Terminating...')
             self.terminate_dynamic()
-            print("Terminated")
+            if VERBOSE:
+                print("Terminated")
             self.reset()
         
         ###################TEMP####################
@@ -201,22 +258,60 @@ class PlannerNode:
         # print("Delta: ", delta)
 
     @classmethod
-    def terminate_dynamic(self, pose):
+    def is_valid_pose(self, pose):
         '''
         '''
         return np.all(pose.translation <= self.BOX_CORNER_MAX) and np.all(pose.translation >= self.BOX_CORNER_MIN)
 
     @classmethod
-    def is_valid_pose(self):
+    def terminate_dynamic(self):
         '''
         '''
         terminate_msg = ShouldTerminateSensorMessage(
-        timestamp=rospy.Time.now().to_time() - self.init_time, should_terminate=True
+            timestamp=rospy.Time.now().to_time() - self.init_time, 
+            should_terminate=True
         )
+
         ros_msg = make_sensor_group_msg(
             termination_handler_sensor_msg=sensor_proto2ros_msg(
-                terminate_msg, SensorDataMessageType.SHOULD_TERMINATE
+                terminate_msg, 
+                SensorDataMessageType.SHOULD_TERMINATE
             )
         )
         self.pub.publish(ros_msg)
         self.fa.wait_for_skill()
+
+if __name__ == "__main__":
+    
+    # rospy.init_node('nightshift-planner')
+    PlannerNode()
+    # while not rospy.is_shutdown():
+    rospy.spin()
+    # rospy.spin()
+    # fa = FrankaArm(with_gripper=False)
+    # print("In main")
+    # pn = PlannerNode()
+    # print(fa.get_pose())
+    # print(fa.get_pose().translation)
+
+    # time.sleep(5)
+    # print(fa.get_tool_base_pose())
+    # # Go to start position
+    # fa.set_tool_delta_pose(pn.NIGHTSHIFT_TOOL_POSE)
+    # print(fa.set_tool_delta_pose(pn.NIGHTSHIFT_TOOL_POSE))
+    
+
+    # # Create a displacement w.r.t the tool and create a goal pose
+    # curr_pose = fa.get_pose()
+    # T_delta = RigidTransform(
+    #     translation=np.array([0.04, -0.1032, 0.0]),
+    #     from_frame=curr_pose.to_frame,
+    #     to_frame=curr_pose.to_frame,
+    # )
+    
+    # goal_pose = T_delta * curr_pose
+    # print("Goal Pose:", goal_pose)
+
+    # # pn.catch(fa, goal_pose)
+    # # pn.catch()
+    # pn.catch(goal_pose)

@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+
+# from concurrent.futures import thread
+import rospy
+from geometry_msgs.msg import PointStamped
+import numpy as np
+import cv2
+import imutils
+# from autolab_core import RigidTransform, Point
+# from perception import CameraIntrinsics
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+# import pathlib
+import os
+import matplotlib.pyplot as plt
+from visualization_msgs.msg import Marker
+
+import message_filters
+
+VERBOSE = False
+
+class BallDetector:
+
+    def __init__(self):
+        print("Initiating Tracker Node with modified intr")
+        self.ball_pos_msg = PointStamped()
+        # filepath = pathlib.Path(__file__).parent.resolve()
+        
+        #self.intrinsics = np.array([909.8428955078125, 0.0, 961.3718872070312, 0.0, 909.5616455078125, 549.1278686523438, 0.0, 0.0, 1.0]).reshape((3,3))
+        #self.intrinsics = np.array([976.85791015625, 0.0, 1022.6757202148438, 0.0, 976.7734375, 782.8008422851562, 0.0, 0.0, 1.0]).reshape((3,3))
+        self.intrinsics = np.array([610.5361938476562, 0.0, 638.9848022460938, 0.0, 610.4833984375, 369.0630187988281, 0.0, 0.0, 1.0]).reshape((3,3))
+        #self.extrinsics = np.array([[-0.425703, 0.050087, 0.903465, -0.064335],
+        #                            [-0.904793, -0.035017, -0.424387, 0.394543],
+        #                            [0.010381, -0.998131, 0.060225, 0.701992],
+        #                            [0, 0, 0, 1]])
+        #self.extrinsics = np.array([[0.9934602, -0.0289219,  0.1104548, -0.067961],
+        #                            [0.0226332,  0.9980733,  0.0577703, -0.39887],
+        #                            [-0.1119128, -0.0548925,  0.9922007, 0.4627],
+        #                            [0, 0, 0, 1]])
+        self.extrinsics = np.array([[0.0256156, -0.1113088,  0.9934556, -0.0712608304860565],
+                                    [-0.9983096, -0.0547128,  0.0196106, -0.4310686706488892],
+                                    [0.0521719, -0.9922786, -0.1125222, 0.46486281934989976],
+                                    [0, 0, 0, 1]])
+                                    
+
+        self.rgb_map = None
+        self.depth_map = None
+
+        self.rgb_header = None
+        self.depth_header = None
+        self.marked_image = None
+
+        self.bridge = CvBridge()
+
+        self.ball_marker = Marker()
+        self.ball_marker.header.frame_id = "panda_link0"
+        self.ball_marker.type = 2
+        self.ball_marker.id = 0
+        self.ball_marker.color.r = 1.0
+        self.ball_marker.color.g = 0.65
+        self.ball_marker.color.b = 0.0
+        self.ball_marker.color.a = 1.0
+        self.ball_marker.scale.x = 0.05
+        self.ball_marker.scale.y = 0.05
+        self.ball_marker.scale.z = 0.05
+        self.ball_marker.pose.orientation.w = 1
+
+        self.rgb_sub = message_filters.Subscriber(
+            "/rgb/image_raw",
+            Image
+        )
+
+        self.depth_sub = message_filters.Subscriber(
+            "/depth_to_rgb/image_raw",
+            Image
+        ) 
+
+        self.ts = message_filters.ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub],10,0.001)
+        self.ts.registerCallback(self.detectBall)
+
+        self.pub = rospy.Publisher(
+            "/ball_detections", 
+            PointStamped,
+            queue_size=2)
+        
+        self.image_pt_pub = rospy.Publisher(
+            "/image_ball_detections", 
+            PointStamped,
+            queue_size=2)
+
+        self.image_pub = rospy.Publisher(
+            "detections_image", 
+            Image,
+            queue_size=2)
+
+        self.rgb_pub = rospy.Publisher(
+            "rgb_detection",
+            Image,
+            queue_size=2
+        )
+
+        self.ball_pub = rospy.Publisher("ball_marker", Marker, queue_size=10)
+
+    def detectBall(self, rgb_msg, depth_msg):
+        # Process RGB msg
+        self.rgb_map = np.frombuffer(rgb_msg.data, dtype=np.uint8).reshape(rgb_msg.height, rgb_msg.width, 4)
+        self.rgb_map = self.rgb_map[:,:,:3]
+        self.rgb_header = rgb_msg.header
+
+        # Process Depth msg
+        self.depth_map = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(depth_msg.height, depth_msg.width, 1)
+        self.depth_header = depth_msg.header
+        
+        if self.rgb_map is None or self.depth_map is None:
+            if VERBOSE:
+                print('No images')
+            return
+        # define the lower and upper boundaries of the "green" ball in the HSV color space
+        # green
+        greenLower = (29, 120, 6)
+        greenUpper = (64, 255, 255)
+
+        # actually red
+        # greenLower = (117, 197, 103)
+        # greenUpper = (255, 255, 255)
+
+        # actually orange
+        # greenLower = (6, 181, 144)#181
+        # greenUpper = (255, 255, 255)
+
+        # if we want to threshold out smaller contours
+        # rad_thresh = 0
+
+        # resize the frame, blur it, and convert it to the HSVcolor space
+        blurred = cv2.GaussianBlur(self.rgb_map, (11, 11), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+        # construct a mask for the color "green"
+        mask = cv2.inRange(hsv, greenLower, greenUpper)
+        # perform dilations and erosions to remove any small blobs left in the mask
+        kernel = np.ones((3, 3), np.uint8)
+        #mask = cv2.erode(mask, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+        # find contours in the mask and initialize the current (x, y) center of the ball
+        cnts = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+
+        # only proceed if at least one contour was found
+        if len(cnts) > 0:
+            # find the largest contour in the mask
+            c = max(cnts, key=cv2.contourArea)
+            # compute the minimum enclosing circle and centroid
+            ((x, y), radius) = cv2.minEnclosingCircle(c)
+            
+            img2 = np.int16(self.depth_map)     # convert to signed 16 bit integer to allow overflow
+            img2 = (1.0/32)*img2  # apply scale factor
+            img2 = np.clip(img2, 0, 255).astype(int) # force all values to be between 0 and 255
+            # after clip img2 is effectively unsigned 8 bit, but make it explicit:
+            img2 = np.uint8(img2)
+
+            backtorgb = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR)
+            
+            self.marked_image = cv2.circle(mask, (int(x),int(y)), int(radius), (255, 0, 0), 2)
+
+            #Add circle over detected ball
+            self.marked_depth_map = cv2.circle(backtorgb, (int(x),int(y)), int(radius), (255,0,0), 2)
+            rgb_marked = cv2.circle(blurred, (int(x),int(y)), int(radius), (255,0,0), 2)
+            # print(f"Ball detected at {round(x,2)}. {round(y,2)}, r={round(radius, 2)}")
+
+            
+            min_radius = 6
+            if radius < min_radius:
+                if VERBOSE:
+                    print("Ball too small: min_radius={}, detected radius={}".format(min_radius, radius))
+                return    
+
+            # only proceed if the radius meets a minimum size
+            # if radius > rad_thresh: # tuning param
+            ball_center, good_depth, kernel_size = self.get_point_in_world(x, y, self.depth_map, radius)
+            if not good_depth:
+                if VERBOSE:
+                    print("Not good depth")
+                return
+            self.marked_depth_map = cv2.rectangle(
+                self.marked_depth_map, 
+                (int(x) - kernel_size, int(y) - kernel_size), 
+                (int(x) + kernel_size, int(y) + kernel_size), 
+                (255,0,0), 
+                3)
+
+            try:
+                self.image_pub.publish(self.bridge.cv2_to_imgmsg(backtorgb, "bgr8"))
+                self.rgb_pub.publish(self.bridge.cv2_to_imgmsg(rgb_marked, "bgr8"))
+            except CvBridgeError as e:
+                if VERBOSE:
+                    print(e)
+
+            if good_depth:
+                # Set up message
+                self.ball_pos_msg.header = self.rgb_header
+                self.ball_pos_msg.header.frame_id = "panda_link0"
+                # TODO change frame ID to world/base_link frame
+                self.ball_pos_msg.point.x = ball_center[0]
+                self.ball_pos_msg.point.y = ball_center[1]
+                self.ball_pos_msg.point.z = ball_center[2]
+                self.pub.publish(self.ball_pos_msg)
+
+                self.ball_marker.header.stamp = rospy.Time.now()
+                self.ball_marker.pose.position.x = ball_center[0]
+                self.ball_marker.pose.position.y = ball_center[1]
+                self.ball_marker.pose.position.z = ball_center[2]
+                self.ball_pub.publish(self.ball_marker)
+
+            return 0
+        else:
+            if VERBOSE:
+                print("No Ball detected!")
+
+    def get_point_in_world(self, center_x, center_y, depth_image, radius): 
+        # thresh = max(25, int(2.5 * radius))
+        thresh = 50
+        # object_center = Point(np.array([center_x, center_y]), 'azure_kinect_overhead')
+        # object_depth = depth_image[max(center_y-thresh, 0): center_y+thresh, max(0, center_x-thresh): center_x+thresh, 0] / 1000
+
+        # if object_depth[object_depth != 0].size != 0:
+        #     object_depth2 = np.min(np.where(object_depth==0, 1e6, object_depth)) / 1000
+        #     print(object_depth2)
+        # else:
+        #     object_depth2 = depth_image[center_y, center_x, 0] / 1000
+        # image_pt = np.array([[center_x, center_y, 1]]).T
+        image_ball_pos_msg = PointStamped()
+        image_ball_pos_msg.header = self.rgb_header
+        image_ball_pos_msg.point.x = center_x/100
+        image_ball_pos_msg.point.y = center_y/100
+        image_ball_pos_msg.point.z = 0
+        # print(self.intrinsics)
+        self.image_pt_pub.publish(image_ball_pos_msg)
+        kernel_size = int(1.5*radius)
+        depth_kernel = depth_image[
+            max(0,int(center_y)-kernel_size):(int(center_y)+kernel_size),
+            max(0,int(center_x)-kernel_size):(int(center_x)+kernel_size), 0
+        ]
+        object_depth = np.median(depth_kernel[np.logical_and(depth_kernel > 500, depth_kernel < 3000)]) / 1000
+        # print(radius, depth_kernel[depth_kernel > 0])
+        # object_depth = 1
+        # print(depth_image[int(center_y), int(center_x), 0])
+        # print(np.r_[np.array([center_x, center_y]), 1.0])
+        camera_frame_pt = np.linalg.inv(self.intrinsics).dot(np.r_[np.array([center_x, center_y]), 1.0]) * object_depth
+        # object_center_point_in_world = self.intrinsics.deproject_pixel(object_depth2, object_center)    
+        # self.extrinsics * 
+        # TODO incorporate extrinsics
+        world_frame_pt = np.matmul(self.extrinsics, np.append(camera_frame_pt, 1).reshape(4, 1))
+        if VERBOSE:
+            print(object_depth)
+        return world_frame_pt, (object_depth > 0.5 and object_depth < 3.0), kernel_size
+
+    # def main_loop(self):
+    #     rate = rospy.Rate(15)
+    #     while not rospy.is_shutdown():
+    #         cont = self.detectBall()
+    #         rate.sleep()
+    #         if cont == -1:
+    #             break
+
+
+if __name__ == '__main__':
+    rospy.init_node('ball_detector')
+    cv2.namedWindow('Track')
+    ball_detector = BallDetector()
+    rospy.spin()
+    # ball_detector.main_loop()
